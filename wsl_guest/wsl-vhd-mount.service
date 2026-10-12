@@ -1,0 +1,14 @@
+[Unit]
+Description=WSL VHD auto-mount hook
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/wsl-vhd-hook.py start
+ExecStop=/usr/local/bin/wsl-vhd-hook.py stop
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

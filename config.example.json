@@ -1,0 +1,15 @@
+{
+  "distro": "Ubuntu",
+  "disks": [
+    {
+      "id": "example000",
+      "vhd_path": "E:\\vhd\\data.vhdx",
+      "name": "data",
+      "mount_target": "/data",
+      "partition": 0,
+      "readonly": false,
+      "bare_fallback": true,
+      "enabled": true
+    }
+  ]
+}
