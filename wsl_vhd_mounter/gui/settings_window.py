@@ -107,6 +107,7 @@ class SettingsWindow(QWidget):
         sp.setRange(0, 32)
         sp.setValue(d.partition)
         sp.setObjectName(f"part_{row}")
+        sp.setToolTip("分区号：0 = 整盘自动（无分区表数据盘必选 0）；>0 = 挂指定分区")
         self._table.setCellWidget(row, 4, sp)
 
         ro = QCheckBox()

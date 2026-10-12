@@ -31,31 +31,47 @@ def _script(text: str) -> str:
     return text.strip()
 
 
-def _find_new_device(distro: str) -> str:
-    """--bare 挂载后，对比挂载前后 lsblk 找新增块设备名。"""
-    before = run_in_distro(distro, "lsblk -dn -o NAME,SIZE")
-    if before.returncode != 0:
+def _find_data_device(distro: str) -> str:
+    """发行版内找未挂载数据盘：TYPE=disk、无挂载点、非 swap、容量最大（单位换算）。"""
+    r = run_in_distro(
+        distro,
+        _script(
+            """
+            python3 - <<'PY'
+            import subprocess
+            out = subprocess.run(["lsblk", "-dn", "-o", "NAME,SIZE,TYPE,MOUNTPOINTS"],
+                                 capture_output=True, text=True).stdout
+            cands = []
+            for ln in out.splitlines():
+                p = ln.split()
+                if len(p) < 3:
+                    continue
+                name, size, typ = p[0], p[1], p[2]
+                mnt = " ".join(p[3:])
+                if typ != "disk" or mnt:
+                    continue
+                s = size.upper()
+                try:
+                    if s.endswith("T"):
+                        v = int(float(s[:-1]) * 1048576)
+                    elif s.endswith("G"):
+                        v = int(float(s[:-1]) * 1024)
+                    elif s.endswith("M"):
+                        v = int(float(s[:-1]))
+                    else:
+                        continue
+                except ValueError:
+                    continue
+                cands.append((v, name))
+            print(sorted(cands, reverse=True)[0][1] if cands else "")
+            PY
+            """
+        ),
+        timeout=60,
+    )
+    if r.returncode != 0:
         return ""
-    before_names = set()
-    for line in before.stdout.splitlines():
-        parts = line.split()
-        if parts:
-            before_names.add(parts[0])
-
-    # 等设备出现（最多 5s）
-    import time
-    for _ in range(5):
-        time.sleep(1)
-        after = run_in_distro(distro, "lsblk -dn -o NAME")
-        if after.returncode == 0:
-            after_names = {line.strip() for line in after.stdout.splitlines() if line.strip()}
-            diff = after_names - before_names
-            if diff:
-                # 优先取 sdx 类设备
-                for name in sorted(diff):
-                    if name.startswith("sd") or name.startswith("vd") or name.startswith("nvme"):
-                        return name
-    return ""
+    return r.stdout.strip()
 
 
 def mount_disk(distro: str, disk: DiskConfig) -> DiskStatus:
@@ -84,52 +100,62 @@ def _mount_disk_locked(distro: str, disk: DiskConfig) -> DiskStatus:
     # 0) 幂等：目标目录已挂载 → 直接成功
     chk = run_in_distro(
         distro,
+        _script(f"mountpoint -q {target} && echo TARGET_OK || echo TARGET_MISS"),
+    )
+    if chk.returncode != 0:
+        return DiskStatus(MountState.ERROR, "发行版内状态检查失败: " + (chk.stderr or chk.stdout))
+    if "TARGET_OK" in chk.stdout:
+        log.info(f"[{name}] 已挂载，跳过")
+        return DiskStatus(MountState.MOUNTED, "已挂载")
+
+    if disk.partition > 0:
+        return _mount_partition(distro, disk, name, target, vhd)
+
+    # 1) 整盘：--bare 附加（幂等：已附加视为成功）
+    r = run_wsl(["--mount", vhd, "--vhd", "--bare"])
+    if r.returncode != 0 and "ALREADY_ATTACHED" not in (r.stderr or r.stdout):
+        return DiskStatus(MountState.ERROR, "磁盘附加失败: " + (r.stderr or r.stdout))
+
+    # 2) 发行版内装载
+    import time
+    dev = ""
+    for _ in range(8):
+        dev = _find_data_device(distro)
+        if dev:
+            break
+        time.sleep(1)
+    if not dev:
+        return DiskStatus(MountState.ERROR, "未探测到数据盘设备(lsblk)")
+    opts = " -o ro" if disk.readonly else ""
+    rb = run_in_distro(
+        distro,
+        _script(f"mkdir -p {target} && mount{opts} /dev/{dev} {target}"),
+    )
+    if rb.returncode != 0:
+        return DiskStatus(MountState.ERROR, f"挂载 /dev/{dev} 到 {target} 失败: " + (rb.stderr or rb.stdout))
+
+    log.info(f"[{name}] 挂载完成: /dev/{dev} -> {target}")
+    return DiskStatus(MountState.MOUNTED, f"已挂载到 {target}" + ("(只读)" if disk.readonly else ""))
+
+
+def _mount_partition(distro: str, disk: DiskConfig, name: str, target: str, vhd: str) -> DiskStatus:
+    """多分区场景：wsl --mount --name 自动装载，bind 到目标目录。"""
+    # 若 VM 层挂载已存在（/mnt/wsl/<name> 或 /mnt/<name>），跳过 wsl --mount
+    chk = run_in_distro(
+        distro,
         _script(
             f"""
-            mountpoint -q {target} && echo TARGET_OK || echo TARGET_MISS
             mountpoint -q /mnt/wsl/{name} && echo MNT_OK || echo MNT_MISS
             mountpoint -q /mnt/{name} && echo MNT_OK || true
             """
         ),
     )
-    if chk.returncode != 0:
-        return DiskStatus(MountState.ERROR, "发行版内状态检查失败: " + (chk.stderr or chk.stdout))
-    out = chk.stdout
-    if "TARGET_OK" in out:
-        log.info(f"[{name}] 已挂载，跳过")
-        return DiskStatus(MountState.MOUNTED, "已挂载")
-
-    # 1) 若 VM 层挂载已存在，跳过 wsl --mount
-    if "MNT_OK" not in out:
-        args = ["--mount", vhd, "--vhd", "--name", name]
-        if disk.partition > 0:
-            args += ["--partition", str(disk.partition)]
+    if "MNT_OK" not in chk.stdout:
+        args = ["--mount", vhd, "--vhd", "--name", name, "--partition", str(disk.partition)]
         r = run_wsl(args)
         if r.returncode != 0:
-            if disk.bare_fallback and disk.partition == 0:
-                log.warn(f"[{name}] 整盘挂载失败，尝试 --bare 兜底")
-                r = run_wsl(["--mount", vhd, "--vhd", "--bare"])
-                if r.returncode != 0:
-                    return DiskStatus(MountState.ERROR, "整盘与 bare 挂载均失败: " + (r.stderr or r.stdout))
-                dev = _find_new_device(distro)
-                if not dev:
-                    return DiskStatus(MountState.ERROR, "bare 挂载成功但未探测到新设备(lsblk 无变化)")
-                log.info(f"[{name}] bare 模式，新设备 /dev/{dev}")
-                r2 = run_in_distro(
-                    distro,
-                    _script(
-                        f"""
-                        mkdir -p {target}
-                        mount /dev/{dev} {target} || exit 10
-                        """
-                    ),
-                )
-                if r2.returncode != 0:
-                    return DiskStatus(MountState.ERROR, f"挂载 /dev/{dev} 到 {target} 失败: " + (r2.stderr or r2.stdout))
-                return _apply_readonly(distro, disk, target)
             return DiskStatus(MountState.ERROR, "wsl --mount 失败: " + (r.stderr or r.stdout))
 
-    # 2) bind: 实际挂载点 -> <target>
     ap = run_in_distro(distro, _attach_path_script(name))
     attach_pt = ""
     for line in ap.stdout.splitlines():
@@ -147,21 +173,9 @@ def _mount_disk_locked(distro: str, disk: DiskConfig) -> DiskStatus:
     )
     if rb.returncode != 0:
         return DiskStatus(MountState.ERROR, f"bind 挂载 {target} 失败: " + (rb.stderr or rb.stdout))
-
-    return _apply_readonly(distro, disk, target, attach_pt=attach_pt)
-
-
-def _apply_readonly(distro: str, disk: DiskConfig, target: str, attach_pt: str | None = None) -> DiskStatus:
-    if not disk.readonly:
-        return DiskStatus(MountState.MOUNTED, f"已挂载到 {target}")
-    src = attach_pt or f"/mnt/wsl/{disk.name}"
-    r = run_in_distro(
-        distro,
-        _script(f"mount -o remount,ro {src} || mount -o remount,ro {target}"),
-    )
-    if r.returncode != 0:
-        log.warn(f"[{disk.name}] 只读 remount 失败(忽略): {r.stderr or r.stdout}")
-    return DiskStatus(MountState.MOUNTED, f"已挂载(只读)到 {target}")
+    if disk.readonly:
+        run_in_distro(distro, _script(f"mount -o remount,ro {attach_pt}"))
+    return DiskStatus(MountState.MOUNTED, f"已挂载到 {target}")
 
 
 def unmount_disk(distro: str, disk: DiskConfig) -> DiskStatus:
@@ -192,21 +206,13 @@ def status_of(distro: str, disk: DiskConfig) -> DiskStatus:
         return DiskStatus(MountState.DISABLED)
     chk = run_in_distro(
         distro,
-        _script(
-            f"""
-            mountpoint -q {disk.mount_target} && echo TARGET_OK || echo TARGET_MISS
-            mountpoint -q /mnt/wsl/{disk.name} && echo MNT_OK || echo MNT_MISS
-            mountpoint -q /mnt/{disk.name} && echo MNT_OK || true
-            """
-        ),
+        _script(f"mountpoint -q {disk.mount_target} && echo TARGET_OK || echo TARGET_MISS"),
         timeout=60,
     )
     if chk.returncode != 0:
         return DiskStatus(MountState.ERROR, "状态查询失败: " + (chk.stderr or chk.stdout))
     if "TARGET_OK" in chk.stdout:
         return DiskStatus(MountState.MOUNTED, f"已挂载到 {disk.mount_target}")
-    if "MNT_OK" in chk.stdout:
-        return DiskStatus(MountState.ATTACHED, "VM 层已挂载，等待绑定")
     return DiskStatus(MountState.UNMOUNTED, "未挂载")
 
 
